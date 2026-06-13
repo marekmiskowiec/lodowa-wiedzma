@@ -1,0 +1,10 @@
+screenshots/
+results/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+.venv/
+.claude/
+CLAUDE.md
