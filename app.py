@@ -40,10 +40,12 @@ ITEM_THRESHOLDS: dict[str, float] = {
 
 # ── Konfiguracja GUI ──────────────────────────────────────────────────────────
 
-PREVIEW_W, PREVIEW_H = 460, 320
+APP_W, APP_H = 840, 580   # stały rozmiar wszystkich okien
+PREVIEW_W, PREVIEW_H = 500, 420
 ICON_SLIDE = 24
 ICON_SUM   = 32
-RIGHT_W    = 290
+RIGHT_W    = 300
+RIGHT_H    = 440           # stała wysokość prawego panelu
 
 ITEM_NAMES: dict[str, str] = {
     "broszura_szermierki":   "Broszura Szermierki",
@@ -272,8 +274,6 @@ def to_slide_data(results: list[dict]) -> list[dict]:
 # ── Ekran startowy ────────────────────────────────────────────────────────────
 
 class StartScreen:
-    W, H = 420, 340
-
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Witcher Drop Tracker")
@@ -282,29 +282,33 @@ class StartScreen:
         self._build()
         root.update()
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"{self.W}x{self.H}+{(sw-self.W)//2}+{(sh-self.H)//2}")
+        root.geometry(f"{APP_W}x{APP_H}+{(sw-APP_W)//2}+{(sh-APP_H)//2}")
 
     def _build(self):
         tk.Label(self.root, text="Witcher Drop Tracker",
-                 font=("Arial", 16, "bold"), pady=14).pack()
+                 font=("Arial", 22, "bold"), pady=24).pack()
 
-        tk.Button(self.root, text="Wybierz screenshoty...", width=24,
-                  font=("Arial", 11), command=self._pick).pack()
+        tk.Button(self.root, text="Wybierz screenshoty...", width=28,
+                  font=("Arial", 13), command=self._pick).pack()
 
-        self._listbox = tk.Listbox(self.root, height=6, width=50,
-                                   font=("Arial", 9), activestyle="none")
-        self._listbox.pack(padx=20, pady=10)
+        self._listbox = tk.Listbox(self.root, height=8, width=60,
+                                   font=("Arial", 11), activestyle="none")
+        self._listbox.pack(padx=30, pady=14)
 
         self._btn_run = tk.Button(self.root, text="Analizuj",
-                                  font=("Arial", 11, "bold"), width=18,
+                                  font=("Arial", 13, "bold"), width=22,
                                   state="disabled", command=self._run)
-        self._btn_run.pack(pady=(0, 8))
+        self._btn_run.pack(pady=(0, 12))
 
-        self._progress = ttk.Progressbar(self.root, length=340, mode="determinate")
-        self._progress.pack(padx=20)
+        style = ttk.Style()
+        style.configure("Big.Horizontal.TProgressbar",
+                        thickness=22, troughcolor="#888888", background="#4a90d9")
+        self._progress = ttk.Progressbar(self.root, length=500, mode="determinate",
+                                         style="Big.Horizontal.TProgressbar")
+        self._progress.pack(padx=30)
 
-        self._status = tk.Label(self.root, text="", font=("Arial", 9), fg="#555")
-        self._status.pack(pady=4)
+        self._status = tk.Label(self.root, text="", font=("Arial", 11), fg="white")
+        self._status.pack(pady=8)
 
     def _pick(self):
         paths = filedialog.askopenfilenames(
@@ -363,7 +367,6 @@ class StartScreen:
     def _launch(self, data: list[dict]):
         for w in self.root.winfo_children():
             w.destroy()
-        self.root.geometry("")  # pozwól tkinter dopasować rozmiar do nowej zawartości
         self.root.resizable(False, False)
         VerificationApp(self.root, data)
 
@@ -396,25 +399,21 @@ class VerificationApp:
                 self._icons_sum[name] = ImageTk.PhotoImage(
                     img.resize((ICON_SUM, ICON_SUM), Image.LANCZOS))
 
-        max_items    = max((len(e["items"]) for e in data), default=4)
-        self._panel_h = 28 + 15 + max_items * 30 + 20 + 44
-        n_unique      = len(all_items)
-        self._sum_h   = max(self._panel_h, 30 + 25 + n_unique * 36 + 70)
-
         self._build()
         self._load_screenshot()
         self.root.update()
-        self._slide_size = self.root.geometry().split("+")[0]
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w, h = self.root.winfo_width(), self.root.winfo_height()
-        self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        _, pos = self.root.geometry().split("+", 1)
+        x, y = (int(v) for v in pos.split("+"))
+        # zachowaj pozycję ze StartScreen, tylko upewnij się że rozmiar jest stały
+        self.root.geometry(f"{APP_W}x{APP_H}+{x}+{y}")
 
     # ── Szkielet ─────────────────────────────────────────────────────────────
 
     def _build(self):
         self.header = tk.Label(self.root, text="",
-                               font=("Arial", 11, "bold"), pady=6)
+                               font=("Arial", 13, "bold"), pady=8)
         self.header.pack(fill="x")
 
         self._main = tk.Frame(self.root)
@@ -425,7 +424,7 @@ class VerificationApp:
                                   width=PREVIEW_W, height=PREVIEW_H)
         self.img_label.grid(row=0, column=0, padx=(0, 16), sticky="n")
 
-        self.right = tk.Frame(self._main, width=RIGHT_W, height=self._panel_h)
+        self.right = tk.Frame(self._main, width=RIGHT_W, height=RIGHT_H)
         self.right.grid(row=0, column=1, sticky="n")
         self.right.grid_propagate(False)
         self.right.columnconfigure(0, minsize=ICON_SLIDE + 6)
@@ -433,7 +432,7 @@ class VerificationApp:
         self.right.columnconfigure(2, minsize=64)
 
         total_w = PREVIEW_W + 16 + RIGHT_W
-        self._sum_frame = tk.Frame(self._main, width=total_w, height=self._sum_h)
+        self._sum_frame = tk.Frame(self._main, width=total_w, height=RIGHT_H)
         self._sum_frame.grid(row=0, column=0, columnspan=2, sticky="nsew")
         self._sum_frame.grid_propagate(False)
         self._sum_frame.grid_remove()
@@ -441,26 +440,26 @@ class VerificationApp:
         nav = tk.Frame(self.root)
         nav.pack(fill="x", padx=12, pady=(6, 2))
 
-        self.btn_prev = tk.Button(nav, text="<- Poprzedni", width=14,
-                                  command=self._prev)
+        self.btn_prev = tk.Button(nav, text="<- Poprzedni", width=18,
+                                  font=("Arial", 11), command=self._prev)
         self.btn_prev.pack(side="left")
 
-        self.lbl_progress = tk.Label(nav, text="", font=("Arial", 10))
+        self.lbl_progress = tk.Label(nav, text="", font=("Arial", 11))
         self.lbl_progress.pack(side="left", expand=True)
 
-        self.btn_next = tk.Button(nav, text="Nastepny ->", width=16,
-                                  font=("Arial", 10, "bold"), command=self._next)
+        self.btn_next = tk.Button(nav, text="Nastepny ->", width=20,
+                                  font=("Arial", 11, "bold"), command=self._next)
         self.btn_next.pack(side="right")
 
         bottom = tk.Frame(self.root)
         bottom.pack(fill="x", padx=12, pady=(0, 10))
 
         self.btn_skip = tk.Button(bottom, text="Przejdz do podsumowania",
-                                  fg="#555", command=self._jump_to_summary)
+                                  font=("Arial", 11), fg="#555", command=self._jump_to_summary)
         self.btn_skip.pack(side="left")
 
-        self.btn_save = tk.Button(bottom, text="Zapisz JSON", width=14,
-                                  font=("Arial", 10, "bold"), command=self._save)
+        self.btn_save = tk.Button(bottom, text="Zapisz JSON", width=18,
+                                  font=("Arial", 11, "bold"), command=self._save)
         self.btn_save.pack(side="right")
         self.btn_save.pack_forget()
 
@@ -516,9 +515,6 @@ class VerificationApp:
         self._sum_frame.grid_remove()
         self.img_label.grid(row=0, column=0, padx=(0, 16), sticky="n")
         self.right.grid(row=0, column=1, sticky="n")
-        if hasattr(self, "_slide_size"):
-            _, pos = self.root.geometry().split("+", 1)
-            self.root.geometry(f"{self._slide_size}+{pos}")
 
         img = cv2.imread(entry["screenshot"])
         if img is not None:
@@ -582,13 +578,7 @@ class VerificationApp:
         self._in_summary = True
         totals, total_yang = self._aggregate()
 
-        n_unique = len(totals)
-        needed_h = 30 + 25 + n_unique * 36 + 60 + 90
-        geo  = self.root.geometry()
-        _, pos = geo.split("+", 1)
-        self.root.geometry(f"{self.root.winfo_width()}x{needed_h}+{pos}")
-
-        self.header.config(text="Podsumowanie dropu")
+        self.header.config(text="Łączny drop")
         self.lbl_progress.config(text="")
         self.btn_prev.config(state="normal", text="<- Poprzedni")
         self.btn_next.config(text="Zamknij", command=self.root.destroy)
@@ -606,12 +596,9 @@ class VerificationApp:
         outer = tk.Frame(self._sum_frame, bg=bg)
         outer.place(relx=0.5, rely=0.5, anchor="center")
 
-        tk.Label(outer, text="Podsumowanie lacznie", bg=bg,
-                 font=("Arial", 13, "bold")).pack(pady=(0, 10))
-
         style = ttk.Style()
-        style.configure("Drop.Treeview", rowheight=36, font=("Arial", 10))
-        style.configure("Drop.Treeview.Heading", font=("Arial", 10, "bold"))
+        style.configure("Drop.Treeview", rowheight=30, font=("Arial", 11))
+        style.configure("Drop.Treeview.Heading", font=("Arial", 11, "bold"))
 
         tree_f = tk.Frame(outer, bg=bg)
         tree_f.pack()
@@ -620,12 +607,9 @@ class VerificationApp:
                              selectmode="none")
         tree.heading("#0",  text="Przedmiot", anchor="w")
         tree.heading("qty", text="Łącznie",   anchor="center")
-        tree.column("#0",  width=260, stretch=False, anchor="w")
-        tree.column("qty", width=80,  stretch=False, anchor="center")
-        sb = ttk.Scrollbar(tree_f, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=sb.set)
-        tree.pack(side="left")
-        sb.pack(side="left", fill="y")
+        tree.column("#0",  width=320, stretch=False, anchor="w")
+        tree.column("qty", width=100, stretch=False, anchor="center")
+        tree.pack()
 
         for item, qty in items:
             icon = self._icons_sum.get(item)
