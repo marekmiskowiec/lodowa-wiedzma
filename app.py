@@ -124,48 +124,110 @@ def non_max_suppression(detections, overlap_thresh):
     return [detections[k] for k in keep]
 
 
+def _digit_nms(detections, overlap_thresh):
+    """NMS z metryką IoU zamiast intersection/area. Sąsiednie cyfry mają niskie IoU
+    (~0.08) i nie są wzajemnie tłumione; fałszywe duplikaty w tym samym miejscu
+    mają wysokie IoU (~0.44+) i są poprawnie eliminowane."""
+    if not detections:
+        return []
+    boxes  = np.array([[d["x"], d["y"], d["x"]+d["w"], d["y"]+d["h"]]
+                       for d in detections], dtype=float)
+    scores = np.array([d["score"] for d in detections])
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+    areas  = (x2-x1+1) * (y2-y1+1)
+    order  = scores.argsort()[::-1]
+    keep   = []
+    while order.size:
+        i = order[0]; keep.append(int(i))
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter   = np.maximum(0, xx2-xx1+1) * np.maximum(0, yy2-yy1+1)
+        union   = areas[i] + areas[order[1:]] - inter
+        overlap = inter / np.maximum(union, 1)
+        order   = order[np.where(overlap <= overlap_thresh)[0] + 1]
+    return [detections[k] for k in keep]
+
+
 def detect_quantity(screenshot_gray, item_box, number_templates):
     x, y, w, h = item_box["x"], item_box["y"], item_box["w"], item_box["h"]
     sh, sw = screenshot_gray.shape[:2]
-    rx, ry   = x + w // 2, y + h * 2 // 5
+    rx, ry   = x + w // 2, y + h * 2 // 3
     rx2, ry2 = min(x + w + 2, sw), min(y + h + 8, sh)
     if rx2 <= rx or ry2 <= ry:
         return 1, None
     region = screenshot_gray[ry:ry2, rx:rx2]
     _, region_bin = cv2.threshold(region, 190, 255, cv2.THRESH_BINARY)
-    best_digit, best_score = None, -1.0
+    all_dets: list[dict] = []
     for tpl in number_templates:
-        raw = multi_scale_match(region_bin, tpl["bin"], NUMBER_SCALES, NUMBER_THRESHOLD)
-        if raw:
-            top = max(raw, key=lambda d: d["score"])
-            if top["score"] > best_score:
-                best_score, best_digit = top["score"], tpl["digit"]
-    return (best_digit, round(best_score, 4)) if best_digit else (1, None)
+        for det in multi_scale_match(region_bin, tpl["bin"], NUMBER_SCALES, NUMBER_THRESHOLD):
+            all_dets.append({**det, "digit": tpl["digit"]})
+    if not all_dets:
+        return 1, None
+    kept = _digit_nms(all_dets, NMS_OVERLAP)
+    # Odrzuć cyfry z innej pozycji pionowej niż najlepsze trafienie
+    # (eliminuje fałszywe cyfry wychwycone z sąsiednich slotów)
+    anchor = max(kept, key=lambda d: d["score"])
+    ref_cy = anchor["y"] + anchor["h"] // 2
+    kept   = [d for d in kept if abs((d["y"] + d["h"] // 2) - ref_cy) <= anchor["h"] // 2]
+    kept.sort(key=lambda d: d["x"])
+    number_str  = "".join(str(d["digit"]) for d in kept)
+    best_score  = max(d["score"] for d in kept)
+    return int(number_str), round(best_score, 4)
 
 
 def read_yang(screenshot_path: str) -> int | None:
     img  = cv2.imread(screenshot_path)
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    strip = gray[h // 3:h - 5, 5:w - 5]
+    # Lewa 1/3 obrazu: yang jest zawsze po lewej stronie okna handlu;
+    # przycięcie eliminuje ikonę yang i "0" drugiej strony, które zaburzały OCR.
+    strip = gray[h // 3:h - 5, 5:w // 3]
     _, binary = cv2.threshold(strip, 170, 255, cv2.THRESH_BINARY)
     row_sums = binary.sum(axis=1) // 255
+
+    # Find contiguous active-row blocks instead of sliding window per row.
+    # Sliding window creates ~14 overlapping crops per text line, causing OCR
+    # to misread partial glyphs and pick the wrong (larger) value.
+    line_regions: list[tuple[int, int]] = []
+    in_line = False
+    line_start = 0
+    for i, s in enumerate(row_sums):
+        if not in_line and s >= 6:
+            in_line, line_start = True, i
+        elif in_line and s < 6:
+            in_line = False
+            line_regions.append((line_start, i))
+    if in_line:
+        line_regions.append((line_start, len(row_sums)))
+
+    MIN_H = 14  # minimalna wysokość regionu dla OCR (po 5x skalowaniu = 70px)
+    strip_h = strip.shape[0]
     best: int | None = None
-    for row_idx in range(len(row_sums)):
-        if row_sums[row_idx] >= 6:
-            y0, y1 = row_idx, min(len(row_sums), row_idx + 14)
-            region = strip[y0:y1, :]
-            big    = cv2.resize(region, (region.shape[1]*5, region.shape[0]*5),
-                                interpolation=cv2.INTER_NEAREST)
-            _, big_bin = cv2.threshold(big, 170, 255, cv2.THRESH_BINARY)
-            text = pytesseract.image_to_string(
-                big_bin, config="--psm 7 -c tessedit_char_whitelist=0123456789.,").strip()
-            for m in re.finditer(r"\d[0-9.,]+\d", text):
-                raw = re.sub(r"[.,]", "", m.group())
-                if raw.isdigit() and len(raw) >= 6:
-                    val = int(raw)
-                    if best is None or val > best:
-                        best = val
+    for y0_raw, y1_raw in line_regions:
+        if y1_raw - y0_raw < MIN_H:
+            pad = (MIN_H - (y1_raw - y0_raw)) // 2
+            y0 = max(0, y0_raw - pad)
+            y1 = min(strip_h, y0 + MIN_H)
+        else:
+            y0, y1 = y0_raw, y1_raw
+        region = strip[y0:y1, :]
+        big    = cv2.resize(region, (region.shape[1]*5, region.shape[0]*5),
+                            interpolation=cv2.INTER_NEAREST)
+        _, big_bin = cv2.threshold(big, 170, 255, cv2.THRESH_BINARY)
+        text = pytesseract.image_to_string(
+            big_bin, config="--psm 7 -c tessedit_char_whitelist=0123456789.,").strip()
+        # \d+ zamiast \d{1,3}: OCR czasem gubi separator między pierwszą cyfrą
+        # a resztą (np. "2.400.000" → "2400,000"); zezwolenie na dowolny prefix
+        # cyfr pozwala to obsłużyć. Końcowe artefakty (np. "7" z ikony yang)
+        # nadal są odrzucane bo nie pasują do grupy [.,]\d{3}.
+        for m in re.finditer(r"\d+(?:[.,]\d{3})+", text):
+            raw = re.sub(r"[.,]", "", m.group())
+            if 6 <= len(raw) <= 9:
+                val = int(raw)
+                if best is None or val > best:
+                    best = val
     return best
 
 
@@ -226,26 +288,39 @@ def cross_item_nms(best_by_name: dict, overlap_thresh: float = 0.3) -> set[str]:
 def process_screenshot(path: str, templates, number_templates) -> dict:
     img_gray = load_image_gray(path)
 
-    # 1. znajdź najlepsze trafienie dla każdego szablonu
-    best_by_name: dict[str, dict] = {}
+    # 1. Per-item NMS: usuń nakładające się dopasowania tego samego szablonu
+    candidates: list[dict] = []
     for tpl in templates:
         raw   = multi_scale_match(img_gray, tpl["gray"], SCALES, tpl["threshold"])
         found = non_max_suppression(raw, NMS_OVERLAP)
-        if found:
-            best_by_name[tpl["name"]] = max(found, key=lambda d: d["score"])
+        for det in found:
+            candidates.append({**det, "name": tpl["name"]})
 
-    # 2. usuń duplikaty między różnymi przedmiotami w tym samym miejscu
-    keep = cross_item_nms(best_by_name)
+    # 2. Globalny NMS przez wszystkie itemy jednocześnie: eliminuje fałszywe dopasowania
+    #    nakładające się z pewniejszymi detekcjami innego przedmiotu (np. fałszywa zmianka
+    #    na pozycji wzmocnienia). Każda pozycja idzie do przedmiotu z najwyższym score.
+    kept_flat = non_max_suppression(candidates, NMS_OVERLAP)
+
+    # 3. Zgrupuj z powrotem po nazwie
+    all_by_name: dict[str, list[dict]] = {}
+    for det in kept_flat:
+        all_by_name.setdefault(det["name"], []).append(det)
 
     detections = {}
     for tpl in templates:
-        name = tpl["name"]
-        best = best_by_name.get(name) if name in keep else None
-        qty, _ = (detect_quantity(img_gray, best, number_templates)
-                  if best and number_templates else (None, None))
+        name      = tpl["name"]
+        instances = all_by_name.get(name, [])
+        best      = max(instances, key=lambda d: d["score"]) if instances else None
+
+        total_qty = 0
+        for inst in instances:
+            q, _ = (detect_quantity(img_gray, inst, number_templates)
+                    if number_templates else (None, None))
+            total_qty += q or 1
+
         detections[name] = {
             "found": best is not None,
-            "quantity": qty,
+            "quantity": total_qty if total_qty > 0 else None,
             "position": {
                 "x":  best["x"], "y":  best["y"],
                 "cx": best["x"] + best["w"] // 2,
