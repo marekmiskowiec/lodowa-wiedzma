@@ -48,7 +48,7 @@ ICON_NAMES: dict[str, str] = {
     "zielona_rosa":              "Zielona Rosa",
     "zwiekszenie_ataku":         "Zwiększenie Ataku",
     "zwinnosc":                  "Zwinność",
-    "łezka":                     "Łezka",
+    "lezka":                     "Łezka",
 }
 
 SCALES          = [0.90, 0.95, 1.0, 1.05, 1.1]
@@ -57,7 +57,13 @@ NMS_OVERLAP     = 0.3
 BUFF_BAR_Y      = 120
 BUFF_BAR_X      = 600
 
-PREVIEW_W, PREVIEW_H = 560, 380
+# Dla zdjęć telefonem: gdy bok > progu, skaluj obraz w dół do ~300px szer.
+# Ikony ~278px stają się ~24px (rozmiar szablonów). Threshold=0.70 bo blur/szum.
+PHONE_THRESHOLD  = 1500
+PHONE_TARGET_W   = 300
+PHONE_THRESHOLD_SCORE = 0.70
+
+PREVIEW_W, PREVIEW_H = 560, 580
 
 
 # ── Detekcja ─────────────────────────────────────────────────────────────────
@@ -122,12 +128,33 @@ def detect_odpal(screenshot_path: str, templates: list[dict]) -> list[dict]:
     if img is None:
         return []
     h, w = img.shape[:2]
-    region = img[:min(BUFF_BAR_Y, h), :min(BUFF_BAR_X, w)]
+
+    # Zdjęcia telefonem: skaluj w dół do PHONE_TARGET_W i przeszukaj cały obraz
+    is_phone = max(h, w) > PHONE_THRESHOLD
+    if is_phone:
+        phone_scale = PHONE_TARGET_W / w
+        ph, pw = max(1, int(h * phone_scale)), PHONE_TARGET_W
+        region    = cv2.resize(img, (pw, ph), interpolation=cv2.INTER_AREA)
+        threshold = PHONE_THRESHOLD_SCORE
+        inv_scale = 1.0 / phone_scale
+    else:
+        region    = img[:min(BUFF_BAR_Y, h), :min(BUFF_BAR_X, w)]
+        threshold = MATCH_THRESHOLD
+        inv_scale = 1.0
+
     all_candidates: list[dict] = []
     for tpl in templates:
-        raw   = multi_scale_match(region, tpl["bgr"], SCALES, MATCH_THRESHOLD)
+        raw   = multi_scale_match(region, tpl["bgr"], SCALES, threshold)
         found = non_max_suppression(raw, NMS_OVERLAP)
         for det in found:
+            if is_phone:
+                det = {
+                    **det,
+                    "x": int(det["x"] * inv_scale),
+                    "y": int(det["y"] * inv_scale),
+                    "w": int(det["w"] * inv_scale),
+                    "h": int(det["h"] * inv_scale),
+                }
             all_candidates.append({**det, "name": tpl["name"]})
     if not all_candidates:
         return []
@@ -231,13 +258,19 @@ class VerificationApp:
     def __init__(self, root: tk.Tk, results: list[dict], templates: list[dict]):
         self.root      = root
         self.root.title("Odpal Detector — Weryfikacja")
-        self._results   = results          # [{path, detections}]
+        self._results   = results
         self._templates = templates
         self._all_names = sorted([t["name"] for t in templates])
-        self._verified: list[list[str]] = []   # lista zatwierdzonych nazw per slajd
         self._idx       = 0
         self._photo     = None
-        self._checks: list[tuple[tk.BooleanVar, str]] = []  # (var, name)
+        self._checks: list[tuple[tk.BooleanVar, str]] = []
+        # Zoom / pan
+        self._zoom      = 1.0
+        self._pan_x     = 0.0   # offset środka widoku w pikselach oryginalnego obrazu
+        self._pan_y     = 0.0
+        self._drag_start: tuple | None = None
+        self._orig_img: Image.Image | None = None   # oryginalny obraz bez skalowania
+        self._detections: list[dict] = []
         self._build()
         self._show(0)
 
@@ -273,6 +306,27 @@ class VerificationApp:
                                  bg="#111", highlightthickness=0)
         self._canvas.pack()
 
+        zoom_bar = tk.Frame(left)
+        zoom_bar.pack(fill="x", pady=(2, 0))
+        tk.Button(zoom_bar, text="−", width=2,
+                  command=lambda: self._zoom_by(0.8)).pack(side="left")
+        tk.Button(zoom_bar, text="+", width=2,
+                  command=lambda: self._zoom_by(1.25)).pack(side="left")
+        tk.Button(zoom_bar, text="Reset", width=6,
+                  command=self._zoom_reset).pack(side="left", padx=4)
+        self._lbl_zoom = tk.Label(zoom_bar, text="100%", fg="#555", width=6)
+        self._lbl_zoom.pack(side="left")
+        tk.Label(zoom_bar, text="(kółko myszy = zoom, przeciągnij = przesunięcie)",
+                 fg="#888", font=("", 7)).pack(side="left", padx=6)
+
+        # Bindingi zoom / pan
+        self._canvas.bind("<MouseWheel>",      self._on_wheel)        # Windows/macOS
+        self._canvas.bind("<Button-4>",        self._on_wheel)        # Linux scroll up
+        self._canvas.bind("<Button-5>",        self._on_wheel)        # Linux scroll down
+        self._canvas.bind("<ButtonPress-1>",   self._on_drag_start)
+        self._canvas.bind("<B1-Motion>",       self._on_drag_move)
+        self._canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+
         # Prawo: panel weryfikacji
         right = tk.Frame(main, width=250, padx=8)
         right.pack(side="left", fill="y")
@@ -285,23 +339,27 @@ class VerificationApp:
         tk.Label(right, text="Wykryte odpalenia:", anchor="w",
                  font=("", 9, "bold")).pack(fill="x")
 
-        # Scrollowalista checkboxów
+        # Lista checkboxów z opcjonalnym scrollem
         chk_outer = tk.Frame(right)
         chk_outer.pack(fill="both", expand=True)
 
-        scrollbar = tk.Scrollbar(chk_outer)
-        scrollbar.pack(side="right", fill="y")
+        self._chk_sb = tk.Scrollbar(chk_outer)
+        self._chk_sb.pack(side="right", fill="y")
 
-        self._chk_canvas = tk.Canvas(chk_outer, yscrollcommand=scrollbar.set,
+        self._chk_canvas = tk.Canvas(chk_outer, yscrollcommand=self._chk_sb.set,
                                      highlightthickness=0)
         self._chk_canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self._chk_canvas.yview)
+        self._chk_sb.config(command=self._chk_canvas.yview)
 
         self._chk_frame = tk.Frame(self._chk_canvas)
-        self._chk_canvas.create_window((0, 0), window=self._chk_frame, anchor="nw")
-        self._chk_frame.bind("<Configure>",
-            lambda e: self._chk_canvas.configure(
-                scrollregion=self._chk_canvas.bbox("all")))
+        self._chk_win = self._chk_canvas.create_window(
+            (0, 0), window=self._chk_frame, anchor="nw")
+
+        self._chk_frame.bind("<Configure>", self._on_chk_frame_resize)
+        self._chk_canvas.bind("<Configure>", self._on_chk_canvas_resize)
+        self._chk_canvas.bind("<MouseWheel>", self._on_chk_scroll)
+        self._chk_canvas.bind("<Button-4>",   self._on_chk_scroll)
+        self._chk_canvas.bind("<Button-5>",   self._on_chk_scroll)
 
         # Dodaj ręcznie
         add_frame = tk.Frame(right)
@@ -331,9 +389,15 @@ class VerificationApp:
         basename = os.path.splitext(os.path.basename(data["path"]))[0]
         self._var_person.set(basename)
 
-        # Buduj checkboxy z wykrytych ikon
-        self._build_checks(data["detections"])
-        self._draw_preview(data["path"], data["detections"])
+        # Reset zoom przy zmianie slajdu
+        self._zoom  = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+
+        self._detections = data["detections"]
+        self._orig_img   = Image.open(data["path"]).convert("RGB")
+        self._build_checks(self._detections)
+        self._redraw()
 
     def _build_checks(self, detections: list[dict]):
         for w in self._chk_frame.winfo_children():
@@ -350,29 +414,114 @@ class VerificationApp:
             cb.pack(fill="x", pady=1)
             self._checks.append((var, name))
 
-    def _draw_preview(self, path: str, detections: list[dict]):
-        img = Image.open(path).convert("RGB")
-        orig_w, orig_h = img.size
-        img.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
-        disp_w, disp_h = img.size
-        sx = disp_w / orig_w
-        sy = disp_h / orig_h
+    def _redraw(self):
+        if self._orig_img is None:
+            return
+        orig_w, orig_h = self._orig_img.size
 
-        draw = ImageDraw.Draw(img)
-        for i, det in enumerate(detections):
+        # Dopasuj obraz do canvas zachowując proporcje (jak thumbnail)
+        fit = self._orig_img.copy()
+        fit.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+        fit_w, fit_h = fit.size
+        sx = fit_w / orig_w
+        sy = fit_h / orig_h
+
+        # Widok w przestrzeni fit-obrazu
+        view_w = fit_w / self._zoom
+        view_h = fit_h / self._zoom
+        cx = fit_w / 2 + self._pan_x
+        cy = fit_h / 2 + self._pan_y
+        cx = max(view_w / 2, min(fit_w - view_w / 2, cx))
+        cy = max(view_h / 2, min(fit_h - view_h / 2, cy))
+        left = cx - view_w / 2
+        top  = cy - view_h / 2
+
+        if self._zoom > 1.0:
+            # Wytnij i przeskaluj do pełnego canvas
+            crop = fit.crop((int(left), int(top),
+                             int(left + view_w), int(top + view_h)))
+            crop_w, crop_h = crop.size
+            display  = crop.resize((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+            dscale_x = PREVIEW_W / crop_w   # rzeczywista skala x po resize
+            dscale_y = PREVIEW_H / crop_h
+            off_x = off_y = 0
+        else:
+            # Pełny obraz wyśrodkowany z czarnymi paskami
+            display  = fit
+            dscale_x = dscale_y = 1.0
+            off_x = (PREVIEW_W - fit_w) // 2
+            off_y = (PREVIEW_H - fit_h) // 2
+            left = top = 0.0
+
+        # Narysuj ramki detekcji na display
+        draw = ImageDraw.Draw(display)
+        for i, det in enumerate(self._detections):
             col = _COLORS[i % len(_COLORS)]
-            x0, y0 = int(det["x"] * sx), int(det["y"] * sy)
-            x1, y1 = int((det["x"] + det["w"]) * sx), int((det["y"] + det["h"]) * sy)
+            x0 = int((det["x"] * sx - left) * dscale_x)
+            y0 = int((det["y"] * sy - top)  * dscale_y)
+            x1 = int(((det["x"] + det["w"]) * sx - left) * dscale_x)
+            y1 = int(((det["y"] + det["h"]) * sy - top)  * dscale_y)
             draw.rectangle([x0, y0, x1, y1], outline=col, width=2)
-            draw.text((x0 + 1, y0 + 1), str(i + 1), fill=col)
+            draw.text((x0 + 2, y0 + 2), str(i + 1), fill=col)
+
+        # Złóż na czarnym tle
+        canvas_img = Image.new("RGB", (PREVIEW_W, PREVIEW_H), (17, 17, 17))
+        canvas_img.paste(display, (off_x, off_y) if self._zoom <= 1.0 else (0, 0))
 
         self._canvas.delete("all")
-        self._photo = ImageTk.PhotoImage(img)
+        self._photo = ImageTk.PhotoImage(canvas_img)
         self._canvas.create_image(PREVIEW_W // 2, PREVIEW_H // 2,
                                   image=self._photo, anchor="center")
+        self._lbl_zoom.config(text=f"{int(self._zoom * 100)}%")
+
+    def _zoom_by(self, factor: float):
+        self._zoom = max(1.0, min(8.0, self._zoom * factor))
+        self._redraw()
+
+    def _zoom_reset(self):
+        self._zoom  = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._redraw()
+
+    def _on_wheel(self, event):
+        if event.num == 4 or event.delta > 0:
+            self._zoom_by(1.25)
+        else:
+            self._zoom_by(0.8)
+
+    def _on_drag_start(self, event):
+        self._drag_start = (event.x, event.y)
+
+    def _on_drag_move(self, event):
+        if self._drag_start is None or self._zoom <= 1.0:
+            return
+        # Ruch myszy w pikselach canvas → ruch w przestrzeni fit-obrazu
+        dx = (event.x - self._drag_start[0]) / self._zoom
+        dy = (event.y - self._drag_start[1]) / self._zoom
+        self._pan_x -= dx
+        self._pan_y -= dy
+        self._drag_start = (event.x, event.y)
+        self._redraw()
+
+
+    def _on_drag_end(self, event):
+        self._drag_start = None
 
     def _on_check_change(self):
-        pass  # można dodać live-odświeżanie ramek w przyszłości
+        pass
+
+    def _on_chk_frame_resize(self, event):
+        self._chk_canvas.configure(scrollregion=self._chk_canvas.bbox("all"))
+
+    def _on_chk_canvas_resize(self, event):
+        self._chk_canvas.itemconfig(self._chk_win, width=event.width)
+
+    def _on_chk_scroll(self, event):
+        if event.num == 4 or event.delta > 0:
+            self._chk_canvas.yview_scroll(-1, "units")
+        else:
+            self._chk_canvas.yview_scroll(1, "units")
 
     def _add_manual(self):
         display = self._var_add.get()
