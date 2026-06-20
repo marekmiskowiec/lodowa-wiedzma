@@ -20,7 +20,8 @@ import pytesseract
 
 # ── Stałe ──────────────────────────────────────────────────────────────────────
 
-APP_W, APP_H = 920, 660
+APP_W, APP_H   = 920, 660
+PREVIEW_W, PREVIEW_H = 450, 530
 
 # Wzór dropów Echo Wygnańców: miejsce → oczekiwana liczba przedmiotów
 _ECHO_PATTERN: dict[int, int] = {
@@ -376,126 +377,330 @@ class EchoDropStartScreen:
 
 class EchoDropResultsApp:
     def __init__(self, root: tk.Tk, results: list[dict]):
-        self.root      = root
-        self.results   = results
-        self.by_player = aggregate_drops(results)
+        self.root    = root
+        self.results = results
+        self._idx    = 0
         self.root.title("Echo Drop — Wyniki")
+        self._bg = self.root.cget("bg")
         self._build()
         root.update()
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"{APP_W}x{APP_H}+{(sw - APP_W) // 2}+{(sh - APP_H) // 2}")
+        root.geometry(f"1100x700+{(sw - 1100) // 2}+{(sh - 700) // 2}")
+        self._show_slide(0)
 
     def _build(self):
-        bg = self.root.cget("bg")
+        bg = self._bg
 
-        tk.Label(self.root, text="Drop z chatu Echo Wygnańców",
-                 font=("Arial", 16, "bold"), pady=12).pack()
+        # Lewa kolumna — podgląd screenshota
+        content = tk.Frame(self.root, bg=bg)
+        content.pack(fill="both", expand=True)
 
-        total   = sum(len(v) for v in self.by_player.values())
-        players = len(self.by_player)
-        tk.Label(self.root,
-                 text=f"{total} dropów  •  {players} graczy  •  {len(self.results)} screenshot(y)",
-                 font=("Arial", 10), fg="#888").pack()
+        self._img_frame = tk.Frame(content, bg="#111111", width=PREVIEW_W)
+        self._img_frame.pack(side="left", fill="y")
+        self._img_frame.pack_propagate(False)
+        self._img_label = tk.Label(self._img_frame, bg="#111111")
+        self._img_label.pack(expand=True, fill="both")
 
-        # Scrollowalna lista kart
-        outer = tk.Frame(self.root)
-        outer.pack(fill="both", expand=True, padx=16, pady=10)
+        # Prawa kolumna — tabelka dropów
+        right = tk.Frame(content, bg=bg)
+        right.pack(side="left", fill="both", expand=True)
 
-        vsb = ttk.Scrollbar(outer, orient="vertical")
-        vsb.pack(side="right", fill="y")
+        r_hdr = tk.Frame(right, bg="#2c5282")
+        r_hdr.pack(fill="x")
+        r_hdr.columnconfigure(0, weight=1)
+        self._title_var = tk.StringVar()
+        tk.Label(r_hdr, textvariable=self._title_var,
+                 bg="#2c5282", fg="white", font=("Arial", 12, "bold"),
+                 anchor="w", padx=10, pady=8).grid(row=0, column=0, sticky="ew")
+        self._count_var = tk.StringVar()
+        self._count_lbl = tk.Label(r_hdr, textvariable=self._count_var,
+                                    bg="#2c5282", fg="#90cdf4",
+                                    font=("Arial", 11, "bold"), padx=10)
+        self._count_lbl.grid(row=0, column=1)
 
-        self._canvas = tk.Canvas(outer, yscrollcommand=vsb.set,
-                                  highlightthickness=0, bg=bg)
-        self._canvas.pack(side="left", fill="both", expand=True)
-        vsb.config(command=self._canvas.yview)
+        t_outer = tk.Frame(right, bg=bg)
+        t_outer.pack(fill="both", expand=True)
+        t_vsb = ttk.Scrollbar(t_outer, orient="vertical")
+        t_vsb.pack(side="right", fill="y")
+        self._t_canvas = tk.Canvas(t_outer, yscrollcommand=t_vsb.set,
+                                    highlightthickness=0, bg=bg)
+        self._t_canvas.pack(side="left", fill="both", expand=True)
+        t_vsb.config(command=self._t_canvas.yview)
+        self._t_inner = tk.Frame(self._t_canvas, bg=bg)
+        self._t_win   = self._t_canvas.create_window((0, 0), window=self._t_inner, anchor="nw")
+        self._t_inner.bind("<Configure>", lambda e: self._t_canvas.configure(
+            scrollregion=self._t_canvas.bbox("all")))
+        self._t_canvas.bind("<Configure>", lambda e: self._t_canvas.itemconfig(
+            self._t_win, width=e.width))
+        self._t_canvas.bind("<MouseWheel>", self._on_scroll)
+        self._t_canvas.bind("<Button-4>",   self._on_scroll)
+        self._t_canvas.bind("<Button-5>",   self._on_scroll)
 
-        self._inner = tk.Frame(self._canvas, bg=bg)
-        self._win   = self._canvas.create_window((0, 0), window=self._inner,
-                                                  anchor="nw")
+        # Pasek nawigacji (dół)
+        nav = tk.Frame(self.root, bg="#1a1a1a")
+        nav.pack(fill="x", side="bottom")
 
-        self._inner.bind("<Configure>", lambda e: self._canvas.configure(
-            scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfig(
-            self._win, width=e.width))
-        self._canvas.bind("<MouseWheel>", self._on_scroll)
-        self._canvas.bind("<Button-4>",   self._on_scroll)
-        self._canvas.bind("<Button-5>",   self._on_scroll)
+        self._btn_prev = tk.Button(nav, text="← Poprzedni", font=("Arial", 11),
+                                    width=14, command=self._prev)
+        self._btn_prev.pack(side="left", padx=12, pady=8)
 
-        self._fill_cards(bg)
+        self._nav_var = tk.StringVar()
+        tk.Label(nav, textvariable=self._nav_var, font=("Arial", 11),
+                 bg="#1a1a1a", fg="#aaaaaa").pack(side="left", expand=True)
 
-        bottom = tk.Frame(self.root)
-        bottom.pack(fill="x", padx=16, pady=(0, 12))
-        tk.Button(bottom, text="Surowy OCR", font=("Arial", 11),
-                  command=self._show_raw).pack(side="left")
-        tk.Button(bottom, text="Nierozpoznane", font=("Arial", 11),
-                  command=self._show_unrecognized).pack(side="left", padx=(8, 0))
-        tk.Button(bottom, text="Zapisz JSON", font=("Arial", 11, "bold"),
-                  width=16, command=self._save).pack(side="right")
+        self._btn_next = tk.Button(nav, text="Następny →", font=("Arial", 11),
+                                    width=14, command=self._next)
+        self._btn_next.pack(side="right", padx=(0, 12), pady=8)
+        tk.Button(nav, text="Zapisz JSON", font=("Arial", 11, "bold"), width=14,
+                  command=self._save).pack(side="right", padx=(0, 4), pady=8)
+        tk.Button(nav, text="Nierozpoznane", font=("Arial", 10),
+                  command=self._show_unrecognized).pack(side="right", padx=(0, 4), pady=8)
+        tk.Button(nav, text="Surowy OCR", font=("Arial", 10),
+                  command=self._show_raw).pack(side="right", padx=(0, 4), pady=8)
 
     def _on_scroll(self, event):
         if event.num == 4 or getattr(event, "delta", 0) > 0:
-            self._canvas.yview_scroll(-1, "units")
+            self._t_canvas.yview_scroll(-1, "units")
         else:
-            self._canvas.yview_scroll(1, "units")
+            self._t_canvas.yview_scroll(1, "units")
 
-    def _fill_cards(self, bg: str):
+    # ── Slajdy ────────────────────────────────────────────────────────────────
+
+    def _show_slide(self, idx: int):
+        self._idx = idx
+        total = len(self.results) + 1  # ostatni slajd = podsumowanie
+        self._nav_var.set(f"{idx + 1} / {total}")
+        self._btn_prev.config(state="normal" if idx > 0 else "disabled")
+        self._btn_next.config(state="normal" if idx < total - 1 else "disabled")
+        if idx < len(self.results):
+            self._show_screenshot_slide(self.results[idx])
+        else:
+            self._show_summary_slide()
+
+    def _show_screenshot_slide(self, result: dict):
+        filename = os.path.basename(result["path"])
+        total    = len(result["drops"])
+        OK_FG, PART_FG, MISS_FG = "#68d391", "#f6ad55", "#fc8181"
+        fg = OK_FG if total >= 39 else (MISS_FG if total == 0 else PART_FG)
+        self._title_var.set(f"  {filename}")
+        self._count_var.set(f"{total}/39 dropów  ")
+        self._count_lbl.config(fg=fg)
+        self._load_image(result["path"])
+        self._fill_drop_rows(result)
+
+    def _show_summary_slide(self):
+        total = sum(len(r["drops"]) for r in self.results)
+        self._title_var.set("  Podsumowanie")
+        self._count_var.set(f"{total} dropów łącznie  ")
+        self._count_lbl.config(fg="#90cdf4")
+        self._img_label.config(
+            image="",
+            text=f"Podsumowanie\n{len(self.results)} screenshots",
+            font=("Arial", 13), fg="#555", compound="center",
+        )
+        self._photo = None
+        self._fill_summary()
+
+    def _load_image(self, path: str):
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            img.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+            self._photo = ImageTk.PhotoImage(img)
+            self._img_label.config(image=self._photo, text="")
+        except Exception:
+            self._img_label.config(image="", text=os.path.basename(path),
+                                   font=("Arial", 10), fg="#555", compound="center")
+
+    # ── Tabelka dropu (slajd screenshota) ─────────────────────────────────────
+
+    def _fill_drop_rows(self, result: dict):
+        bg      = self._bg
+        ROW_ODD = "#2a2a2a"
+        PLR_BG  = "#1e3a5f"
+        MISS_BG = "#3b1a1a"
+        OK_FG   = "#68d391"
+        PART_FG = "#f6ad55"
+        MISS_FG = "#fc8181"
+
+        for w in self._t_inner.winfo_children():
+            w.destroy()
+
+        # Grupuj dropy po graczu, zachowując kolejność z chatu
+        by_player: dict[str, list[tuple[int, dict]]] = {}
+        for i, d in enumerate(result["drops"]):
+            by_player.setdefault(d["player"], []).append((i, d))
+
+        for pos, (player, entries) in enumerate(by_player.items(), start=1):
+            expected = expected_drops(pos)
+            found    = len(entries)
+            score_fg = OK_FG if found >= expected else (MISS_FG if found == 0 else PART_FG)
+
+            # Nagłówek gracza
+            plr_row = tk.Frame(self._t_inner, bg=PLR_BG)
+            plr_row.pack(fill="x", pady=(6, 0))
+            plr_row.columnconfigure(0, weight=1)
+            tk.Label(plr_row, text=f"  {player}", bg=PLR_BG, fg="#90cdf4",
+                     font=("Arial", 10, "bold"), anchor="w", pady=3).grid(
+                     row=0, column=0, sticky="ew")
+            tk.Label(plr_row, text=f"{found}/{expected}  ", bg=PLR_BG, fg=score_fg,
+                     font=("Arial", 9, "bold")).grid(row=0, column=1)
+            tk.Button(plr_row, text="+", bg="#276749", fg="white",
+                      font=("Arial", 9, "bold"), relief="flat", padx=5, pady=1,
+                      command=lambda r=result, p=player: self._add_drop(r, p)
+                      ).grid(row=0, column=2, padx=(0, 4))
+
+            # Wiersze przedmiotów
+            for j, (orig_idx, d) in enumerate(entries):
+                row_bg = ROW_ODD if j % 2 else bg
+                row    = tk.Frame(self._t_inner, bg=row_bg)
+                row.pack(fill="x")
+                row.columnconfigure(0, weight=1)
+                tk.Label(row, text=f"    {d['item']}", bg=row_bg, font=("Arial", 10),
+                         anchor="w", pady=4).grid(row=0, column=0, sticky="ew")
+                tk.Button(row, text="×", bg="#c53030", fg="white",
+                          font=("Arial", 9, "bold"), relief="flat", padx=4, pady=0,
+                          command=lambda r=result, di=orig_idx: self._delete_drop(r, di)
+                          ).grid(row=0, column=1, padx=(0, 4))
+
+            # Placeholdery brakujących dropów
+            for _ in range(expected - found):
+                ph = tk.Frame(self._t_inner, bg=MISS_BG, cursor="hand2")
+                ph.pack(fill="x")
+                ph.columnconfigure(0, weight=1)
+                lbl = tk.Label(ph, text="    — brakuje —", bg=MISS_BG, fg="#fc8181",
+                               font=("Arial", 10, "italic"), anchor="w", pady=4)
+                lbl.grid(row=0, column=0, sticky="ew")
+                for w in (ph, lbl):
+                    w.bind("<Button-1>", lambda e, r=result, p=player: self._add_drop(r, p))
+
+        tk.Button(self._t_inner, text="+ Dodaj drop", bg="#276749", fg="white",
+                  font=("Arial", 10), relief="flat", padx=8, pady=4,
+                  command=lambda: self._add_drop(result)
+                  ).pack(pady=8, anchor="w", padx=6)
+
+        self._t_canvas.yview_moveto(0)
+
+    # ── Slajd podsumowujący ───────────────────────────────────────────────────
+
+    def _fill_summary(self):
+        bg      = self._bg
         HDR_BG  = "#2c5282"
         HDR_FG  = "#ffffff"
         ROW_ODD = "#2a2a2a"
-        OK_FG   = "#68d391"   # zielony — komplet
-        MISS_FG = "#fc8181"   # czerwony — brakuje
-        PART_FG = "#f6ad55"   # pomarańczowy — częściowy
+        OK_FG   = "#68d391"
+        MISS_FG = "#fc8181"
+        PART_FG = "#f6ad55"
 
-        for pos, (player, items) in enumerate(self.by_player.items(), start=1):
+        for w in self._t_inner.winfo_children():
+            w.destroy()
+
+        by_player: dict[str, list[str]] = {}
+        for r in self.results:
+            for d in r["drops"]:
+                by_player.setdefault(d["player"], []).append(d["item"])
+
+        for pos, (player, items) in enumerate(by_player.items(), start=1):
             expected = expected_drops(pos)
             found    = len(items)
             counts: dict[str, int] = {}
             for item in items:
                 counts[item] = counts.get(item, 0) + 1
+            score_fg = OK_FG if found >= expected else (MISS_FG if found == 0 else PART_FG)
+            mark     = "✓" if found >= expected else ("✗" if found == 0 else "~")
 
-            if found >= expected:
-                score_fg, mark = OK_FG,   "✓"
-            elif found == 0:
-                score_fg, mark = MISS_FG, "✗"
-            else:
-                score_fg, mark = PART_FG, "~"
+            card = tk.Frame(self._t_inner, bg=bg)
+            card.pack(fill="x", padx=4, pady=(4, 0))
 
-            card = tk.Frame(self._inner, bg=bg)
-            card.pack(fill="x", padx=10, pady=(8, 0))
-
-            # Nagłówek gracza
             hdr = tk.Frame(card, bg=HDR_BG)
             hdr.pack(fill="x")
             hdr.columnconfigure(1, weight=1)
             tk.Label(hdr, text=f"  #{pos}", bg=HDR_BG, fg="#90cdf4",
                      font=("Arial", 10), width=4, anchor="w").grid(row=0, column=0)
             tk.Label(hdr, text=player, bg=HDR_BG, fg=HDR_FG,
-                     font=("Arial", 11, "bold"), pady=5,
+                     font=("Arial", 11, "bold"), pady=4,
                      anchor="w").grid(row=0, column=1, sticky="ew")
-            tk.Label(hdr, text=f"{mark} {found}/{expected}  ", bg=HDR_BG, fg=score_fg,
+            tk.Label(hdr, text=f"{mark} {found}  ", bg=HDR_BG, fg=score_fg,
                      font=("Arial", 10, "bold")).grid(row=0, column=2)
 
-            # Wiersze itemów
             tbl = tk.Frame(card, bg=bg)
             tbl.pack(fill="x")
             tbl.columnconfigure(0, weight=1)
-
             for i, (item, cnt) in enumerate(sorted(counts.items())):
                 row_bg = ROW_ODD if i % 2 else bg
-                row = tk.Frame(tbl, bg=row_bg)
+                row    = tk.Frame(tbl, bg=row_bg)
                 row.grid(row=i, column=0, sticky="ew")
                 row.columnconfigure(0, weight=1)
                 tk.Label(row, text=f"  {item}", bg=row_bg, font=("Arial", 10),
-                         anchor="w", pady=3).grid(row=0, column=0, sticky="ew")
+                         anchor="w", pady=2).grid(row=0, column=0, sticky="ew")
                 tk.Label(row, text=f"x{cnt}  " if cnt > 1 else "   ",
                          bg=row_bg, font=("Arial", 10), fg="#aaa",
                          width=5, anchor="e").grid(row=0, column=1)
 
+        self._t_canvas.yview_moveto(0)
+
+    # ── Nawigacja ─────────────────────────────────────────────────────────────
+
+    def _prev(self):
+        if self._idx > 0:
+            self._show_slide(self._idx - 1)
+
+    def _next(self):
+        if self._idx < len(self.results):
+            self._show_slide(self._idx + 1)
+
+    # ── Edycja ────────────────────────────────────────────────────────────────
+
+    def _delete_drop(self, result: dict, drop_idx: int):
+        result["drops"].pop(drop_idx)
+        self._fill_drop_rows(result)
+
+    def _add_drop(self, result: dict, default_player: str = ""):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Dodaj drop")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Gracz:", font=("Arial", 11)).grid(
+            row=0, column=0, padx=12, pady=(12, 4), sticky="e")
+        player_var = tk.StringVar(value=default_player)
+        player_cb  = ttk.Combobox(dlg, textvariable=player_var,
+                                   values=sorted(KNOWN_PLAYERS), width=26)
+        player_cb.grid(row=0, column=1, padx=12, pady=(12, 4))
+
+        tk.Label(dlg, text="Przedmiot:", font=("Arial", 11)).grid(
+            row=1, column=0, padx=12, pady=4, sticky="e")
+        item_var = tk.StringVar()
+        item_cb  = ttk.Combobox(dlg, textvariable=item_var,
+                                  values=sorted(KNOWN_ITEMS), width=26)
+        item_cb.grid(row=1, column=1, padx=12, pady=4)
+
+        def _confirm():
+            p = player_var.get().strip()
+            i = item_var.get().strip()
+            if not p or not i:
+                return
+            result["drops"].append({"player": p, "item": i})
+            dlg.destroy()
+            self._fill_drop_rows(result)
+
+        tk.Button(dlg, text="Dodaj", font=("Arial", 11, "bold"),
+                  command=_confirm).grid(row=2, column=0, columnspan=2, pady=12)
+        dlg.bind("<Return>", lambda e: _confirm())
+        (item_cb if default_player else player_cb).focus_set()
+
+    # ── Eksport i diagnostyka ─────────────────────────────────────────────────
+
     def _save(self):
-        data = {
-            player: sorted(items)
-            for player, items in self.by_player.items()
-        }
+        data = []
+        for r in self.results:
+            by_player: dict[str, list[str]] = {}
+            for d in r["drops"]:
+                by_player.setdefault(d["player"], []).append(d["item"])
+            data.append({
+                "screenshot": os.path.basename(r["path"]),
+                "drops": by_player,
+            })
         path = filedialog.asksaveasfilename(
             title="Zapisz wyniki dropu",
             defaultextension=".json",
